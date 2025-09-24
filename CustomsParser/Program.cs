@@ -58,7 +58,7 @@ Actions:
  2) Keep rows where column matches regex
  3) Keep rows where column is NOT empty
  4) Trim all cells
- 5) Transform a column (in-place):
+ 5) Transform a column:
     1=Trim
     2=Replace regex
     3=Left N
