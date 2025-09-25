@@ -1,4 +1,4 @@
-﻿// Program.cs — Console-only UI for PDF -> line table -> actions -> JSON
+﻿// Program.cs — Console UI for PDF -> line table -> actions -> export
 // Requires: itext7 (NuGet) and Core/*.cs from this project.
 
 using iText.Kernel.Pdf;
@@ -6,7 +6,7 @@ using iText.Kernel.Pdf.Canvas.Parser;
 using iText.Kernel.Pdf.Canvas.Parser.Listener;
 using PdfTableMvp.Core;
 using System.Text;
-using System.Text.Json; // <-- for CloneSteps deep copy of StepBase list
+using System.Text.Json; // for CloneSteps deep copy of StepBase list
 using CoreTable = PdfTableMvp.Core.Table;
 
 namespace PdfTableMvp
@@ -80,7 +80,7 @@ Actions:
     f=Cut last N chars → NEW column
  7) Keep ONLY selected columns
  8) Drop first row (header)
- 9) Rename columns (become JSON attribute names)
+ 9) Rename columns (become JSON/XML attribute names)
 10) Show preview (limited)
 11) Export current table to JSON
 
@@ -96,7 +96,7 @@ Actions:
 14) Load a Parser & Run (auto-router if configured) on this PDF
 15) Show session steps
 16) Clear session steps
-17) Run ALL Rules in a Parser and export ONE JSON (Rule → array or scalar)
+17) Run Parser (with router if present) and export ONE XML
 18) Convert table to single header value (pick cell / optional regex)
 
 --- Edit saved Rule as SESSION (load & modify without losing work) ---
@@ -119,7 +119,7 @@ Actions:
                 {
                     case "0": Console.WriteLine("Bye."); return;
 
-                    // ====== ACTIONS (YOUR EXISTING HANDLERS KEPT) ======
+                    // ====== ACTIONS ======
                     case "1":
                         {
                             var colSel = AskColumnSelector(table);
@@ -398,7 +398,7 @@ Actions:
 
                             var cfg = ParserStore.Load(names[pick]);
 
-                            // Transparent Multi-Parser: if router exists, auto-route and run
+                            // Transparent Multi-Parser: if router exists, auto-route and run (legacy preview mode)
                             if (ParserStore.RouterExists(cfg.Name) &&
                                 ParserRunner.TryRunWithRouting(
                                     cfg,
@@ -431,7 +431,6 @@ Actions:
                             break;
                         }
 
-
                     case "15":
                         {
                             if (sessionSteps.Count == 0) { Console.WriteLine("No session steps."); break; }
@@ -454,36 +453,21 @@ Actions:
 
                             var cfg = ParserStore.Load(names[pick]);
 
-                            Console.Write("Output JSON path (e.g., all_rules_output.json): ");
+                            Console.Write("Output XML path (e.g., result.xml): ");
                             var outPath = (Console.ReadLine() ?? "").Trim();
-                            if (string.IsNullOrWhiteSpace(outPath)) outPath = "all_rules_output.json";
+                            if (string.IsNullOrWhiteSpace(outPath)) outPath = "result.xml";
 
-                            // If router exists for this parser, export PARENT + ROUTED SUBPARSER together.
-                            if (ParserStore.RouterExists(cfg.Name) &&
-                                ParserRunner.TryBuildCombinedRouterExport(
-                                    cfg,
-                                    () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
-                                    out var combined,
-                                    msg => Console.WriteLine(msg)))
-                            {
-                                var json = System.Text.Json.JsonSerializer.Serialize(combined, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-                                File.WriteAllText(outPath, json);
-                                Console.WriteLine($"Saved combined (parent + routed) export: {Path.GetFullPath(outPath)}");
-                            }
-                            else
-                            {
-                                // Fallback: single parser export (no router)
-                                ParserRunner.ExportAllRulesToOneJson(
-                                    cfg,
-                                    () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
-                                    outPath,
-                                    msg => Console.WriteLine(msg)
-                                );
-                                Console.WriteLine($"Saved: {Path.GetFullPath(outPath)}");
-                            }
+                            // Export to XML: single parser or (if router exists) parent+target combined XML
+                            XmlExporter.ExportParserOrRoutedToXml(
+                                cfg,
+                                () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
+                                outPath,
+                                msg => Console.WriteLine(msg)
+                            );
+
+                            Console.WriteLine($"Saved: {Path.GetFullPath(outPath)}");
                             break;
                         }
-
 
                     case "18":
                         {
@@ -510,7 +494,7 @@ Actions:
                             ApplyStep(step, table);
                             sessionSteps.Add(step);
 
-                            Console.WriteLine("Converted to scalar. In option 17 (run ALL rules), this Rule will appear as a top-level JSON property with a single value.");
+                            Console.WriteLine("Converted to scalar. In option 17 (run ALL rules), this Rule will appear in HeaderInfo.");
                             break;
                         }
 

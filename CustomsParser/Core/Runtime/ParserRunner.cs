@@ -129,7 +129,7 @@ namespace PdfTableMvp.Core
             return false;
         }
 
-        // Legacy: run ONLY one rule of the target (kept for option 14 backward-compat)
+        // Legacy preview: run ONLY one rule of the target (kept for option 14)
         public static bool TryRunWithRouting(
             ParserConfig parentParser,
             Func<Table> freshTableFactory,
@@ -191,7 +191,7 @@ namespace PdfTableMvp.Core
             return true;
         }
 
-        // NEW: build a SINGLE JSON that contains Parent + Routed Sub-Parser results (for option 17)
+        // Build a combined object (Parent + Routed) we can transform to XML
         public static bool TryBuildCombinedRouterExport(
             ParserConfig parentParser,
             Func<Table> freshTableFactory,
@@ -243,9 +243,9 @@ namespace PdfTableMvp.Core
 
             var targetCfg = ParserStore.Load(targetParserName!);
 
-            // Optional exclusions (if you later add ExcludeRules to RouterConfig)
-            ISet<string>? exclude = null; // keep null unless you add property
-            // Example if you add: exclude = new HashSet<string>(router.ExcludeRules ?? new(), StringComparer.OrdinalIgnoreCase);
+            ISet<string>? exclude = null;
+            if (router.ExcludeRules is { Count: > 0 })
+                exclude = new HashSet<string>(router.ExcludeRules!, StringComparer.OrdinalIgnoreCase);
 
             // Run ALL rules on PARENT (include Tag too)
             var parentValues = RunAllRulesToJsonValues(parentParser, freshTableFactory, msg => log($"[parent] {msg}"));
