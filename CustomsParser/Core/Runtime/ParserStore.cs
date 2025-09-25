@@ -1,11 +1,19 @@
 ﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 
-
 namespace PdfTableMvp.Core
 {
     public static class ParserStore
     {
+        private static string RootFor(string name)
+            => Path.Combine(Environment.CurrentDirectory, "parsers", Sanitize(name));
+
+        private static string ParserJsonPath(string name)
+            => Path.Combine(RootFor(name), "parser.json");
+
+        private static string RouterJsonPath(string name)
+            => Path.Combine(RootFor(name), "router.json");
+
         private static readonly JsonSerializerOptions JsonOpts = new()
         {
             WriteIndented = true,
@@ -17,22 +25,27 @@ namespace PdfTableMvp.Core
             }
         };
 
-        public static bool Exists(string name)
+        private static readonly JsonSerializerOptions RouterJsonOpts = new()
         {
-            string root = Path.Combine(Environment.CurrentDirectory, "parsers", Sanitize(name));
-            return File.Exists(Path.Combine(root, "parser.json"));
-        }
+            WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            Converters = { new JsonStringEnumConverter() }
+        };
+
+        public static bool Exists(string name)
+            => File.Exists(ParserJsonPath(name));
 
         public static void Save(ParserConfig cfg)
         {
             if (cfg == null) throw new ArgumentNullException(nameof(cfg));
-            if (string.IsNullOrWhiteSpace(cfg.Name)) throw new ArgumentException("ParserConfig.Name is required.", nameof(cfg));
+            if (string.IsNullOrWhiteSpace(cfg.Name))
+                throw new ArgumentException("ParserConfig.Name is required.", nameof(cfg));
 
-            string root = Path.Combine(Environment.CurrentDirectory, "parsers", Sanitize(cfg.Name));
+            string root = RootFor(cfg.Name);
             Directory.CreateDirectory(root);
             Directory.CreateDirectory(Path.Combine(root, "versions"));
 
-            string main = Path.Combine(root, "parser.json");
+            string main = ParserJsonPath(cfg.Name);
             string version = Path.Combine(root, "versions", DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json");
 
             var json = JsonSerializer.Serialize(cfg, JsonOpts);
@@ -43,9 +56,7 @@ namespace PdfTableMvp.Core
         public static ParserConfig Load(string name)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name is required.", nameof(name));
-
-            string root = Path.Combine(Environment.CurrentDirectory, "parsers", Sanitize(name));
-            string main = Path.Combine(root, "parser.json");
+            string main = ParserJsonPath(name);
             if (!File.Exists(main)) throw new FileNotFoundException("parser.json not found for: " + name, main);
 
             var json = File.ReadAllText(main);
@@ -62,9 +73,34 @@ namespace PdfTableMvp.Core
 
             return Directory.GetDirectories(root)
                 .Where(d => File.Exists(Path.Combine(d, "parser.json")))
-                .Select(Path.GetFileName)
+                .Select(d => Path.GetFileName(d) ?? "")
                 .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+        }
+
+        // ---- Router I/O ----
+
+        public static bool RouterExists(string parserName)
+            => File.Exists(RouterJsonPath(parserName));
+
+        public static RouterConfig LoadRouter(string parserName)
+        {
+            var path = RouterJsonPath(parserName);
+            if (!File.Exists(path)) return new RouterConfig(); // empty config
+            var json = File.ReadAllText(path);
+            var rc = JsonSerializer.Deserialize<RouterConfig>(json, RouterJsonOpts) ?? new RouterConfig();
+            if (rc.Routes == null) rc.Routes = new List<RouteRule>();
+            if (string.IsNullOrWhiteSpace(rc.TagRuleName)) rc.TagRuleName = "Tag";
+            return rc;
+        }
+
+        public static void SaveRouter(string parserName, RouterConfig router)
+        {
+            if (string.IsNullOrWhiteSpace(parserName)) throw new ArgumentException("parserName required");
+            Directory.CreateDirectory(RootFor(parserName));
+            var json = JsonSerializer.Serialize(router, RouterJsonOpts);
+            File.WriteAllText(RouterJsonPath(parserName), json);
         }
 
         private static string Sanitize(string s)
