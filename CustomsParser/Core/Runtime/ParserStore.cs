@@ -71,12 +71,12 @@ namespace PdfTableMvp.Core
             string root = Path.Combine(Environment.CurrentDirectory, "parsers");
             if (!Directory.Exists(root)) return new List<string>();
 
+            // Avoid nullability warning by coalescing null to empty
             return Directory.GetDirectories(root)
                 .Where(d => File.Exists(Path.Combine(d, "parser.json")))
-                .Select(d => Path.GetFileName(d) ?? "")
+                .Select(d => Path.GetFileName(d) ?? string.Empty)
                 .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
                 .ToList();
-
         }
 
         // ---- Router I/O ----
@@ -91,6 +91,7 @@ namespace PdfTableMvp.Core
             var json = File.ReadAllText(path);
             var rc = JsonSerializer.Deserialize<RouterConfig>(json, RouterJsonOpts) ?? new RouterConfig();
             if (rc.Routes == null) rc.Routes = new List<RouteRule>();
+            if (rc.ExcludeRules == null) rc.ExcludeRules = new List<string>();
             if (string.IsNullOrWhiteSpace(rc.TagRuleName)) rc.TagRuleName = "Tag";
             return rc;
         }

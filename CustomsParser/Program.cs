@@ -107,8 +107,8 @@ Actions:
 27) Re-run session on original text (refresh preview)
 
 --- Optional: Multi-Parser Router ---
-28) Configure Router for a Parser (Tag rule + routes)
-29) Dry-run Router: compute Tag & show which route would match
+28) Configure Router for a Parser (Tag rule + routes + optional excludes)
+29) Dry-run Router: compute Tag & show which target parser would match
 
  0) Exit
 ");
@@ -119,10 +119,7 @@ Actions:
                 {
                     case "0": Console.WriteLine("Bye."); return;
 
-                    // ====== ACTIONS (unchanged) ======
-                    // ... (everything from your current Program.cs is kept intact below)
-                    // I only changed case "14", and added cases "28" and "29".
-
+                    // ====== ACTIONS (YOUR EXISTING HANDLERS KEPT) ======
                     case "1":
                         {
                             var colSel = AskColumnSelector(table);
@@ -401,17 +398,60 @@ Actions:
 
                             var cfg = ParserStore.Load(names[pick]);
 
-                            // Transparent Multi-Parser: if router exists, auto-route and run
+                            // Transparent Multi-Parser: if router exists, auto-route and RUN ALL RULES of target parser
                             if (ParserStore.RouterExists(cfg.Name) &&
                                 ParserRunner.TryRunWithRouting(
                                     cfg,
                                     () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
-                                    out var routed,
-                                    msg => Console.WriteLine(msg)))
+                                    msg => Console.WriteLine(msg),
+                                    out var targetParserName,
+                                    out var aggregated))
                             {
-                                table = routed!;
-                                Console.WriteLine("\n--- ROUTED RESULT PREVIEW ---");
-                                PreviewTable(table, 50, showPages: true, showRowIndex: true);
+                                Console.WriteLine($"\n--- ROUTED to parser: {targetParserName} ---");
+                                Console.WriteLine("Summary of results per rule:");
+                                foreach (var kv in aggregated!)
+                                {
+                                    var kind = kv.Value is string ? "scalar" : "rows";
+                                    if (kv.Value is string s)
+                                        Console.WriteLine($" • {kv.Key}: SCALAR = \"{s}\"");
+                                    else if (kv.Value is System.Text.Json.Nodes.JsonArray)
+                                        Console.WriteLine($" • {kv.Key}: JSON array");
+                                    else if (kv.Value is IEnumerable<object> en)
+                                        Console.WriteLine($" • {kv.Key}: {en.Cast<object>().Count()} row(s)");
+                                    else
+                                        Console.WriteLine($" • {kv.Key}: {kv.Value?.GetType().Name ?? "null"}");
+                                }
+
+                                if (AskYesNo("Export aggregated JSON? (y/n): "))
+                                {
+                                    Console.Write("Output path [routed_output.json]: ");
+                                    var outPath = (Console.ReadLine() ?? "").Trim();
+                                    if (string.IsNullOrWhiteSpace(outPath)) outPath = "routed_output.json";
+                                    var json = System.Text.Json.JsonSerializer.Serialize(aggregated, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                                    File.WriteAllText(outPath, json);
+                                    Console.WriteLine($"Saved: {Path.GetFullPath(outPath)}");
+                                }
+
+                                // Optional: preview a single rule from TARGET parser
+                                if (AskYesNo("Preview a specific rule from the target parser? (y/n): "))
+                                {
+                                    var targetCfg = ParserStore.Load(targetParserName!);
+                                    if (targetCfg.Rules.Count == 0) { Console.WriteLine("Target parser has no rules."); break; }
+                                    Console.WriteLine($"\n{targetCfg.Name} rules:");
+                                    for (int i = 0; i < targetCfg.Rules.Count; i++)
+                                        Console.WriteLine($"{i + 1}) {targetCfg.Rules[i].Name}");
+
+                                    int ri = AskInt($"Preview which rule (1..{targetCfg.Rules.Count}): ", 1, targetCfg.Rules.Count) - 1;
+
+                                    var fresh = CoreTable.FromSingleColumnLines(originalLines, originalRowPages);
+                                    ParserRunner.RunRule(targetCfg, targetCfg.Rules[ri].Name, fresh, msg => Console.WriteLine(msg));
+
+                                    Console.WriteLine("\n--- RULE PREVIEW ---");
+                                    PreviewTable(fresh, 50, showPages: true, showRowIndex: true);
+
+                                    // keep this preview as working table so user can continue
+                                    table = fresh;
+                                }
                                 break;
                             }
 
@@ -422,15 +462,15 @@ Actions:
                             for (int i = 0; i < cfg.Rules.Count; i++)
                                 Console.WriteLine($"{i + 1}) {cfg.Rules[i].Name} ({cfg.Rules[i].RuleSteps.Count} step(s))");
 
-                            int ri = AskInt($"Run which Rule (1..{cfg.Rules.Count}): ", 1, cfg.Rules.Count) - 1;
+                            int ri2 = AskInt($"Run which Rule (1..{cfg.Rules.Count}): ", 1, cfg.Rules.Count) - 1;
 
-                            var fresh = CoreTable.FromSingleColumnLines(originalLines, originalRowPages);
-                            ParserRunner.RunRule(cfg, cfg.Rules[ri].Name, fresh, msg => Console.WriteLine(msg));
+                            var fresh2 = CoreTable.FromSingleColumnLines(originalLines, originalRowPages);
+                            ParserRunner.RunRule(cfg, cfg.Rules[ri2].Name, fresh2, msg => Console.WriteLine(msg));
 
                             Console.WriteLine("\n--- RESULT PREVIEW ---");
-                            PreviewTable(fresh, 50, showPages: true, showRowIndex: true);
+                            PreviewTable(fresh2, 50, showPages: true, showRowIndex: true);
 
-                            table = fresh;
+                            table = fresh2;
                             break;
                         }
 
@@ -626,9 +666,9 @@ Actions:
                             }
 
                             if (winner != null)
-                                Console.WriteLine($"Dry-run: Tag=\"{tag}\" matches => {winner.TargetParser}/{winner.TargetRule}");
+                                Console.WriteLine($"Dry-run: Tag=\"{tag}\" matches => {winner.TargetParser}");
                             else if (!string.IsNullOrWhiteSpace(router.DefaultTargetParser))
-                                Console.WriteLine($"Dry-run: no rule matched; would use DEFAULT => {router.DefaultTargetParser}/{router.DefaultTargetRule}");
+                                Console.WriteLine($"Dry-run: no rule matched; would use DEFAULT => {router.DefaultTargetParser}");
                             else
                                 Console.WriteLine("Dry-run: no rule matched and no default specified.");
                             break;
@@ -678,54 +718,35 @@ Actions:
                     int tpi = AskInt($"Pick (1..{names.Count}): ", 1, names.Count) - 1;
                     var targetParser = ParserStore.Load(names[tpi]);
 
-                    // Pick target rule
-                    string targetRule = targetParser.Rules.FirstOrDefault()?.Name ?? "Main";
-                    if (targetParser.Rules.Count > 0)
-                    {
-                        Console.WriteLine($"Target parser '{targetParser.Name}' rules:");
-                        for (int i = 0; i < targetParser.Rules.Count; i++)
-                            Console.WriteLine($"{i + 1}) {targetParser.Rules[i].Name}");
-                        int tri = AskInt($"Pick rule (1..{targetParser.Rules.Count}) [1]: ", 1, targetParser.Rules.Count) - 1;
-                        targetRule = targetParser.Rules[tri].Name;
-                    }
-                    else
-                    {
-                        Console.WriteLine("Target parser has no rules; route will still be saved.");
-                    }
-
                     router.Routes.Add(new RouteRule
                     {
                         Kind = kind,
                         Pattern = pattern,
                         CaseInsensitive = ci,
-                        TargetParser = targetParser.Name,
-                        TargetRule = targetRule
+                        TargetParser = targetParser.Name
                     });
                     Console.WriteLine("Route added.");
                 }
 
-                if (AskYesNo("Configure DEFAULT (fallback) target? (y/n): "))
+                // Exclude rules (optional)
+                Console.Write("Exclude rules when running the TARGET parser (comma-separated, blank = none): ");
+                var excl = (Console.ReadLine() ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(excl))
+                    router.ExcludeRules = new List<string>();
+                else
+                    router.ExcludeRules = excl.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+
+                if (AskYesNo("Configure DEFAULT (fallback) target parser? (y/n): "))
                 {
                     var names2 = ParserStore.ListParsers();
                     for (int i = 0; i < names2.Count; i++) Console.WriteLine($"{i + 1}) {names2[i]}");
                     int di = AskInt($"Pick default parser (1..{names2.Count}): ", 1, names2.Count) - 1;
                     var defParser = ParserStore.Load(names2[di]);
-                    string defRule = defParser.Rules.FirstOrDefault()?.Name ?? "Main";
-                    if (defParser.Rules.Count > 0)
-                    {
-                        Console.WriteLine($"Default parser '{defParser.Name}' rules:");
-                        for (int i = 0; i < defParser.Rules.Count; i++)
-                            Console.WriteLine($"{i + 1}) {defParser.Rules[i].Name}");
-                        int dri = AskInt($"Pick rule (1..{defParser.Rules.Count}) [1]: ", 1, defParser.Rules.Count) - 1;
-                        defRule = defParser.Rules[dri].Name;
-                    }
                     router.DefaultTargetParser = defParser.Name;
-                    router.DefaultTargetRule = defRule;
                 }
                 else
                 {
                     router.DefaultTargetParser = null;
-                    router.DefaultTargetRule = null;
                 }
 
                 ParserStore.SaveRouter(parserName, router);

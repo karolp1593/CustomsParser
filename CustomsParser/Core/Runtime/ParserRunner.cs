@@ -26,15 +26,34 @@ namespace PdfTableMvp.Core
         public static void ApplySingleStep(StepBase step, Table t, MissingColumnPolicy policy, Action<string> log)
             => step.Apply(t, policy, log);
 
+        // Base version (kept)
         public static Dictionary<string, object> RunAllRulesToJsonValues(
             ParserConfig cfg,
             Func<Table> freshTableFactory,
             Action<string> log)
+            => RunAllRulesToJsonValues(cfg, freshTableFactory, log, excludeRules: null);
+
+        // New overload with exclude list
+        public static Dictionary<string, object> RunAllRulesToJsonValues(
+            ParserConfig cfg,
+            Func<Table> freshTableFactory,
+            Action<string> log,
+            IEnumerable<string>? excludeRules)
         {
             var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
+            var exclude = new HashSet<string>(
+                (excludeRules ?? Array.Empty<string>()),
+                StringComparer.OrdinalIgnoreCase);
+
             foreach (var rule in cfg.Rules)
             {
+                if (exclude.Contains(rule.Name))
+                {
+                    log($"[skip] Rule '{rule.Name}' excluded by router.");
+                    continue;
+                }
+
                 var table = freshTableFactory();
                 log($"--- Running Rule: {rule.Name} ---");
 
@@ -93,7 +112,6 @@ namespace PdfTableMvp.Core
             }
 
             var t = freshTableFactory();
-            int totalEnabled = tagRule.RuleSteps.Count(s => s.Enabled);
             int step = 0;
             foreach (var s in tagRule.RuleSteps)
             {
@@ -121,13 +139,16 @@ namespace PdfTableMvp.Core
             return false;
         }
 
+        // NEW: resolve a target parser, then RUN ALL RULES of that parser and return aggregated JSON
         public static bool TryRunWithRouting(
             ParserConfig parentParser,
             Func<Table> freshTableFactory,
-            out Table? routedResult,
-            Action<string> log)
+            Action<string> log,
+            out string? targetParserName,
+            out Dictionary<string, object>? aggregatedJson)
         {
-            routedResult = null;
+            targetParserName = null;
+            aggregatedJson = null;
 
             var router = ParserStore.LoadRouter(parentParser.Name);
             if (router.Routes.Count == 0 && string.IsNullOrWhiteSpace(router.DefaultTargetParser))
@@ -159,12 +180,11 @@ namespace PdfTableMvp.Core
             }
 
             string? targetParser = winner?.TargetParser ?? router.DefaultTargetParser;
-            string? targetRule = winner?.TargetRule ?? router.DefaultTargetRule;
 
             if (winner != null)
-                log($"Router: matched {winner.Kind} '{winner.Pattern}' -> {targetParser}/{targetRule}");
+                log($"Router: matched {winner.Kind} '{winner.Pattern}' -> {targetParser}");
             else if (!string.IsNullOrWhiteSpace(targetParser))
-                log($"Router: no rule matched; using DEFAULT -> {targetParser}/{targetRule}");
+                log($"Router: no rule matched; using DEFAULT -> {targetParser}");
             else
             {
                 log("Router: no route matched and no default specified.");
@@ -172,15 +192,15 @@ namespace PdfTableMvp.Core
             }
 
             var targetCfg = ParserStore.Load(targetParser!);
+            targetParserName = targetCfg.Name;
 
-            // choose rule: explicit or first one
-            string ruleName = targetRule!;
-            if (string.IsNullOrWhiteSpace(ruleName))
-                ruleName = targetCfg.Rules.FirstOrDefault()?.Name ?? throw new Exception($"Target parser '{targetCfg.Name}' has no rules.");
-
-            var t = freshTableFactory();
-            RunRule(targetCfg, ruleName, t, m => log($"[routed] {m}"));
-            routedResult = t;
+            // Run ALL rules of the target parser, optionally excluding some
+            aggregatedJson = RunAllRulesToJsonValues(
+                targetCfg,
+                freshTableFactory: freshTableFactory,
+                log: m => log($"[routed] {m}"),
+                excludeRules: router.ExcludeRules
+            );
             return true;
         }
 
@@ -217,6 +237,5 @@ namespace PdfTableMvp.Core
             RegexExtractStep rx => $"Regex extract (/{rx.Pattern}/ all={rx.AllMatches} inPlace={rx.InPlace})",
             _ => s.GetType().Name
         };
-
     }
 }

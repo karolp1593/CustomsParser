@@ -9,25 +9,31 @@ namespace PdfTableMvp.Core
         public RouteMatchKind Kind { get; set; } = RouteMatchKind.Exact;
         public string Pattern { get; set; } = "";
         public bool CaseInsensitive { get; set; } = true;
+
+        // Now only the target PARSER. We run ALL rules of this parser.
         public string TargetParser { get; set; } = "";
-        public string TargetRule { get; set; } = "Main";
 
         public override string ToString()
         {
             var kind = Kind == RouteMatchKind.Exact ? "EXACT" : "REGEX";
             var ci = CaseInsensitive ? "ci" : "cs";
-            return $"{kind} '{Pattern}' -> {TargetParser}/{TargetRule} ({ci})";
+            return $"{kind} '{Pattern}' -> {TargetParser} ({ci})";
         }
     }
 
     public class RouterConfig
     {
+        // Which rule in the PARENT parser computes the Tag
         public string TagRuleName { get; set; } = "Tag";
+
         public List<RouteRule> Routes { get; set; } = new();
 
         // Optional fallback if nothing matches
         public string? DefaultTargetParser { get; set; }
-        public string? DefaultTargetRule { get; set; }
+
+        // Optional: when running ALL rules of the target parser,
+        // skip rules listed here (case-insensitive compare).
+        public List<string> ExcludeRules { get; set; } = new();
 
         public string Describe()
         {
@@ -41,7 +47,9 @@ namespace PdfTableMvp.Core
                     sb.AppendLine($" {i + 1}) {Routes[i]}");
             }
             if (!string.IsNullOrWhiteSpace(DefaultTargetParser))
-                sb.AppendLine($"Default: {DefaultTargetParser}/{DefaultTargetRule}");
+                sb.AppendLine($"Default: {DefaultTargetParser}");
+            if (ExcludeRules != null && ExcludeRules.Count > 0)
+                sb.AppendLine("ExcludeRules: " + string.Join(", ", ExcludeRules));
             return sb.ToString();
         }
     }
