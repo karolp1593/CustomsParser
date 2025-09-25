@@ -362,8 +362,20 @@ Actions:
                             if (mode == "replace") rule.RuleSteps = new List<StepBase>(sessionSteps);
                             else rule.RuleSteps.AddRange(sessionSteps);
 
+                            // Build a fresh preview using the steps that will be saved (for the partition wizard)
+                            var previewForPartition = RebuildFromSession(
+                                originalLines,
+                                originalRowPages,
+                                rule.RuleSteps,
+                                cfg.MissingPolicy,
+                                msg => Console.WriteLine("[preview] " + msg));
+
+                            // ---- Partition wizard ----
+                            rule.Partition = ConfigurePartitionWizard(previewForPartition, rule.Partition);
+
                             ParserStore.Save(cfg);
-                            Console.WriteLine($"Saved {sessionSteps.Count} step(s) under Parser '{cfg.Name}' › Rule '{rule.Name}'.");
+                            Console.WriteLine($"Saved {rule.RuleSteps.Count} step(s) under Parser '{cfg.Name}' › Rule '{rule.Name}'"
+                                + (rule.Partition != null ? " [partition configured]." : "."));
                             break;
                         }
 
@@ -382,7 +394,8 @@ Actions:
                                     int enabled = r.RuleSteps.Count(s => s.Enabled);
                                     int disabled = r.RuleSteps.Count - enabled;
                                     var tail = disabled > 0 ? $"{enabled} step(s), {disabled} disabled" : $"{enabled} step(s)";
-                                    Console.WriteLine($"    • {r.Name} — {tail}");
+                                    var part = r.Partition != null ? " [partition]" : "";
+                                    Console.WriteLine($"    • {r.Name}{part} — {tail}");
                                 }
                             }
                             break;
@@ -960,6 +973,154 @@ Actions:
             }
             Console.WriteLine(new string('-', 80));
             Console.WriteLine("Columns: " + string.Join(" | ", t.ColumnNames));
+        }
+
+        // ---------------- Partition wizard ----------------
+
+        static TablePartition? ConfigurePartitionWizard(CoreTable preview, TablePartition? existing)
+        {
+            Console.WriteLine();
+            if (existing == null)
+            {
+                bool add = AskYesNo("Partition this rule's TABLE output into multiple elements by a key column? (y/n): ");
+                if (!add) return null;
+
+                // New config
+                var col = AskColumnSelector(preview);
+
+                Console.Write("Attribute name for the key (blank = auto from column name): ");
+                var attr = (Console.ReadLine() ?? "").Trim();
+                if (attr.Length == 0) attr = null;
+
+                bool keepKey = AskYesNo("Keep the key column as a Row attribute too? (y/n): ");
+                bool dropEmpty = AskYesNo("Drop rows where key is EMPTY? (y/n): ");
+                string emptyLabel = "(empty)";
+                if (!dropEmpty)
+                {
+                    Console.Write("Label for EMPTY key values [(empty)]: ");
+                    var inp = Console.ReadLine() ?? "";
+                    if (!string.IsNullOrWhiteSpace(inp)) emptyLabel = inp.Trim();
+                }
+                bool trim = AskYesNo("Trim whitespace around the key before grouping? (y/n): ");
+                bool ci = AskYesNo("Case-insensitive grouping? (y/n): ");
+
+                // Show a tiny preview of distinct keys
+                ShowDistinctKeyPreview(preview, col, trim, ci, dropEmpty, emptyLabel);
+
+                return new TablePartition
+                {
+                    Column = col,
+                    AttributeName = attr,
+                    KeepKeyInRows = keepKey,
+                    DropEmptyKeyRows = dropEmpty,
+                    EmptyKeyLabel = emptyLabel,
+                    TrimKey = trim,
+                    CaseInsensitive = ci
+                };
+            }
+            else
+            {
+                Console.WriteLine("A partition is already configured for this rule.");
+                Console.WriteLine("Choose: 1=Keep as is, 2=Modify, 3=Remove");
+                Console.Write("Pick (1/2/3): ");
+                var pick = (Console.ReadLine() ?? "").Trim();
+                if (pick == "1" || string.IsNullOrEmpty(pick)) return existing;
+                if (pick == "3") return null;
+
+                // MODIFY
+                var current = existing;
+
+                Console.Write("Change key column? (y/n, blank=keep current): ");
+                var chCol = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+                var col = current.Column;
+                if (chCol is "y" or "yes")
+                    col = AskColumnSelector(preview);
+
+                Console.Write($"Attribute name for the key (blank=keep, '-'=auto). Current: {(current.AttributeName ?? "(auto)")} : ");
+                var attrIn = (Console.ReadLine() ?? "").Trim();
+                string? attr = current.AttributeName;
+                if (attrIn == "-") attr = null;
+                else if (attrIn.Length > 0) attr = attrIn;
+
+                bool? keepKey = AskYesNoNullable($"Keep key column as Row attribute? (y/n, blank=keep current [{current.KeepKeyInRows}]): ");
+                bool? dropEmpty = AskYesNoNullable($"Drop rows where key is EMPTY? (y/n, blank=keep current [{current.DropEmptyKeyRows}]): ");
+
+                string emptyLabel = current.EmptyKeyLabel;
+                if (!(dropEmpty ?? current.DropEmptyKeyRows))
+                {
+                    Console.Write($"Label for EMPTY key values [current: {current.EmptyKeyLabel}]: ");
+                    var inp = Console.ReadLine() ?? "";
+                    if (!string.IsNullOrWhiteSpace(inp)) emptyLabel = inp.Trim();
+                }
+
+                bool? trim = AskYesNoNullable($"Trim whitespace around key? (y/n, blank=keep current [{current.TrimKey}]): ");
+                bool? ci = AskYesNoNullable($"Case-insensitive grouping? (y/n, blank=keep current [{current.CaseInsensitive}]): ");
+
+                // Show distinct key preview with (possibly) updated knobs
+                ShowDistinctKeyPreview(
+                    preview,
+                    col,
+                    (trim ?? current.TrimKey),
+                    (ci ?? current.CaseInsensitive),
+                    (dropEmpty ?? current.DropEmptyKeyRows),
+                    emptyLabel);
+
+                return new TablePartition
+                {
+                    Column = col,
+                    AttributeName = attr,
+                    KeepKeyInRows = keepKey ?? current.KeepKeyInRows,
+                    DropEmptyKeyRows = dropEmpty ?? current.DropEmptyKeyRows,
+                    EmptyKeyLabel = emptyLabel,
+                    TrimKey = trim ?? current.TrimKey,
+                    CaseInsensitive = ci ?? current.CaseInsensitive
+                };
+            }
+        }
+
+        static bool? AskYesNoNullable(string prompt)
+        {
+            Console.Write(prompt);
+            var s = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(s)) return null;
+            if (s is "y" or "yes") return true;
+            if (s is "n" or "no") return false;
+            return AskYesNoNullable(prompt); // re-ask if invalid
+        }
+
+        static void ShowDistinctKeyPreview(
+            CoreTable preview,
+            ColumnSelector keySelector,
+            bool trimKey,
+            bool caseInsensitive,
+            bool dropEmpty,
+            string emptyLabel)
+        {
+            if (!keySelector.TryResolveIndex(preview, out int keyCol) || keyCol < 0 || keyCol >= preview.ColumnCount)
+            {
+                Console.WriteLine("(!) Could not resolve the key column on the preview table; partition will still be saved.");
+                return;
+            }
+
+            var cmp = caseInsensitive ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            var set = new HashSet<string>(cmp);
+            var sample = new List<string>();
+
+            for (int i = 0; i < preview.Rows.Count; i++)
+            {
+                var cells = preview.Rows[i];
+                var raw = keyCol < cells.Length ? (cells[keyCol] ?? "") : "";
+                var k = trimKey ? raw.Trim() : raw;
+                if (string.IsNullOrEmpty(k))
+                {
+                    if (dropEmpty) continue;
+                    k = emptyLabel ?? "";
+                }
+                if (set.Add(k) && sample.Count < 10)
+                    sample.Add(k);
+            }
+
+            Console.WriteLine($"Distinct key preview: {set.Count} unique value(s). Sample: {string.Join(" | ", sample)}");
         }
     }
 }
