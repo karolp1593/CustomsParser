@@ -1,219 +1,277 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace PdfTableMvp.Core
 {
     public static class XmlExporter
     {
-        // ===== Public entry point used by Program.cs (option 17) =====
-        public static void ExportParserOrRoutedToXml(
-            ParserConfig parentParser,
+        // ------------------- Public high-level exports -------------------
+
+        /// <summary>
+        /// Unified entry: if router exists & matches, export parent+target;
+        /// otherwise export just the single parser.
+        /// </summary>
+        public static XDocument ExportParserOrRoutedToXml(
+            ParserConfig cfg,
             Func<Table> freshTableFactory,
-            string outputPath,
             Action<string> log)
         {
-            XDocument doc;
-
-            // If no router configured — export single parser
-            if (!ParserStore.RouterExists(parentParser.Name))
+            if (!ParserStore.RouterExists(cfg.Name))
             {
-                doc = BuildSingleParserDocument(parentParser, freshTableFactory, log);
-                doc.Save(outputPath);
-                return;
+                log("Router: not configured; exporting single parser.");
+                return ExportParserToXml(cfg, freshTableFactory, log);
             }
 
-            // Router exists: evaluate tag, pick target, then export combined
-            var router = ParserStore.LoadRouter(parentParser.Name);
+            var router = ParserStore.LoadRouter(cfg.Name);
 
-            string? tagValue = null;
-            bool tagOk = ParserRunner.TryEvaluateTag(parentParser, router.TagRuleName, freshTableFactory, log, out var tv);
-            if (tagOk) tagValue = tv;
-
-            // Pick target parser (match Exact/Regex or fallback to default)
-            string? targetParserName = null;
-            if (tagOk)
+            // Compute Tag
+            if (!ParserRunner.TryEvaluateTag(cfg, router.TagRuleName, freshTableFactory, log, out var tag))
             {
-                RouteRule? winner = null;
-                foreach (var r in router.Routes)
+                log("Router: could not compute Tag; exporting single parser.");
+                return ExportParserToXml(cfg, freshTableFactory, log);
+            }
+
+            // Find matching route
+            RouteRule? winner = null;
+            foreach (var r in router.Routes)
+            {
+                bool match = r.Kind switch
                 {
-                    bool match = r.Kind == RouteMatchKind.Exact
-                        ? string.Equals(tagValue, r.Pattern,
-                            r.CaseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.CurrentCulture)
-                        : System.Text.RegularExpressions.Regex.IsMatch(tagValue ?? "", r.Pattern ?? "",
-                            r.CaseInsensitive ? System.Text.RegularExpressions.RegexOptions.IgnoreCase : System.Text.RegularExpressions.RegexOptions.None);
-                    if (match) { winner = r; break; }
-                }
-                targetParserName = winner?.TargetParser ?? router.DefaultTargetParser;
-                if (winner != null)
-                    log($"Router: matched {winner.Kind} '{winner.Pattern}' -> {targetParserName}");
-                else if (!string.IsNullOrWhiteSpace(targetParserName))
-                    log($"Router: no rule matched; using DEFAULT -> {targetParserName}");
+                    RouteMatchKind.Exact => string.Equals(
+                        tag,
+                        r.Pattern,
+                        r.CaseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.CurrentCulture),
+                    RouteMatchKind.Regex => Regex.IsMatch(
+                        tag ?? "",
+                        r.Pattern ?? "",
+                        r.CaseInsensitive ? RegexOptions.IgnoreCase : RegexOptions.None),
+                    _ => false
+                };
+                if (match) { winner = r; break; }
             }
-            else
-            {
-                // No tag — fallback to default if present
-                targetParserName = router.DefaultTargetParser;
-            }
+
+            string? targetParserName = winner?.TargetParser ?? router.DefaultTargetParser;
 
             if (string.IsNullOrWhiteSpace(targetParserName))
             {
-                log("Router: no route matched and no default specified — exporting PARENT only.");
-                doc = BuildSingleParserDocument(parentParser, freshTableFactory, log, tagRuleName: router.TagRuleName, tagValue: tagValue);
-                doc.Save(outputPath);
-                return;
+                log("Router: no route matched and no default target; exporting single parser.");
+                return ExportParserToXml(cfg, freshTableFactory, log);
             }
 
-            var targetCfg = ParserStore.Load(targetParserName!);
+            var targetCfg = ParserStore.Load(targetParserName);
+            log($"Router: exporting PARENT='{cfg.Name}' + TARGET='{targetCfg.Name}' (Tag='{tag}').");
 
-            // Build combined doc
-            doc = new XDocument(new XDeclaration("1.0", "utf-8", "yes"));
-            var root = new XElement("Result",
-                new XAttribute("ranAt", DateTime.UtcNow.ToString("o")));
-            doc.Add(root);
-
-            // ParserInfo
-            root.Add(BuildParserInfo(
-                parser: parentParser.Name,
-                subparser: targetCfg.Name,
-                routed: true,
-                tagRuleName: router.TagRuleName,
-                tagValue: tagValue));
-
-            // HeaderInfo (scalars from parent + target). Resolve duplicates.
-            var header = new XElement("HeaderInfo");
-            root.Add(header);
-
-            // Run parent rules
-            var parentRuns = RunAllRulesToTables(parentParser, freshTableFactory, msg => log($"[parent] {msg}"));
-
-            // Run target rules (optionally exclude)
-            ISet<string>? exclude = null;
-            try
-            {
-                // If you added RouterConfig.ExcludeRules, use it. Otherwise this remains null.
-                // ReSharper disable once ConstantConditionalAccessQualifier
-                if (router?.ExcludeRules != null && router.ExcludeRules.Count > 0)
-                    exclude = new HashSet<string>(router.ExcludeRules, StringComparer.OrdinalIgnoreCase);
-            }
-            catch { /* property may not exist in older RouterConfig; ignore */ }
-
-            var targetRuns = RunAllRulesToTables(targetCfg, freshTableFactory, msg => log($"[target] {msg}"), exclude);
-
-            // 1) Scalars to HeaderInfo (unique attribute names)
-            AppendScalars(header, parentRuns);
-            AppendScalars(header, targetRuns);
-
-            // 2) Table rules as elements (unique element names)
-            AppendTables(root, parentRuns);
-            AppendTables(root, targetRuns);
-
-            // Save
-            doc.Save(outputPath);
+            return ExportParentAndTargetToXml(cfg, router, tag ?? string.Empty, targetCfg, freshTableFactory, log);
         }
 
-        // ===== Single parser export (no routing) =====
-        private static XDocument BuildSingleParserDocument(
-            ParserConfig cfg,
-            Func<Table> freshTableFactory,
-            Action<string> log,
-            string? tagRuleName = null,
-            string? tagValue = null)
+        /// <summary>
+        /// Run ALL rules for a single parser and produce the XML document.
+        /// - Scalars become attributes on &lt;HeaderInfo&gt;
+        /// - Tables become elements named by rule.Name
+        /// - If rule.Partition is set, the table is split into multiple sibling elements by the key
+        /// </summary>
+        public static XDocument ExportParserToXml(ParserConfig cfg, Func<Table> freshTableFactory, Action<string> log)
         {
-            var doc = new XDocument(new XDeclaration("1.0", "utf-8", "yes"));
-            var root = new XElement("Result",
-                new XAttribute("ranAt", DateTime.UtcNow.ToString("o")));
-            doc.Add(root);
+            var doc = NewResultDoc(out var root);
 
-            // ParserInfo (no subparser)
-            root.Add(BuildParserInfo(cfg.Name, subparser: null, routed: false, tagRuleName: tagRuleName, tagValue: tagValue));
+            // ParserInfo (single-parser)
+            root.Add(BuildParserInfo(cfg.Name, subparser: null, routed: false, tagRuleName: null, tagValue: null));
 
-            // HeaderInfo + table rules
-            var header = new XElement("HeaderInfo");
-            root.Add(header);
+            // Collect scalars (from all rules)
+            var headerScalars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-            var runs = RunAllRulesToTables(cfg, freshTableFactory, log);
-            AppendScalars(header, runs);
-            AppendTables(root, runs);
+            foreach (var rule in cfg.Rules)
+            {
+                var t = RunRuleToTable(cfg, rule, freshTableFactory, log);
+
+                if (t.IsScalar)
+                {
+                    headerScalars[rule.Name] = t.ScalarValue ?? "";
+                }
+                else
+                {
+                    if (rule.Partition != null)
+                    {
+                        foreach (var e in BuildPartitionedTableElements(rule.Name, t, rule.Partition))
+                            root.Add(e);
+                    }
+                    else
+                    {
+                        root.Add(BuildTableElement(rule.Name, t));
+                    }
+                }
+            }
+
+            // HeaderInfo first
+            root.AddFirst(BuildHeaderInfo(headerScalars));
+            return doc;
+        }
+
+        /// <summary>
+        /// Combined export for Multi-Parser (parent + target subparser).
+        /// HeaderInfo includes scalars from BOTH.
+        /// Tables from BOTH are appended under &lt;Result&gt;.
+        /// If router.ExcludeRules is configured, target rules listed there are skipped.
+        /// </summary>
+        public static XDocument ExportParentAndTargetToXml(
+            ParserConfig parentCfg,
+            RouterConfig router,
+            string tag,
+            ParserConfig targetCfg,
+            Func<Table> freshTableFactory,
+            Action<string> log)
+        {
+            var doc = NewResultDoc(out var root);
+
+            // ParserInfo (routed)
+            root.Add(BuildParserInfo(
+                parser: parentCfg.Name,
+                subparser: targetCfg.Name,
+                routed: true,
+                tagRuleName: string.IsNullOrWhiteSpace(router.TagRuleName) ? "Tag" : router.TagRuleName,
+                tagValue: tag));
+
+            var headerScalars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            void RunOne(ParserConfig cfg, ISet<string>? exclude)
+            {
+                foreach (var rule in cfg.Rules)
+                {
+                    if (exclude != null && exclude.Contains(rule.Name))
+                    {
+                        log($"[skip] Rule '{rule.Name}' excluded.");
+                        continue;
+                    }
+
+                    var t = RunRuleToTable(cfg, rule, freshTableFactory, msg => log($"[{cfg.Name}] {msg}"));
+
+                    if (t.IsScalar)
+                    {
+                        headerScalars[rule.Name] = t.ScalarValue ?? "";
+                    }
+                    else
+                    {
+                        if (rule.Partition != null)
+                        {
+                            foreach (var e in BuildPartitionedTableElements(rule.Name, t, rule.Partition))
+                                root.Add(e);
+                        }
+                        else
+                        {
+                            root.Add(BuildTableElement(rule.Name, t));
+                        }
+                    }
+                }
+            }
+
+            // Parent
+            RunOne(parentCfg, exclude: null);
+
+            // Target (with optional excludes from router)
+            ISet<string>? excludes = null;
+            if (router.ExcludeRules != null && router.ExcludeRules.Count > 0)
+                excludes = new HashSet<string>(router.ExcludeRules, StringComparer.OrdinalIgnoreCase);
+
+            RunOne(targetCfg, excludes);
+
+            // HeaderInfo first
+            root.AddFirst(BuildHeaderInfo(headerScalars));
 
             return doc;
         }
 
-        // ===== Helpers to run rules and gather tables =====
-        private static IEnumerable<(RuleDefinition rule, Table table)> RunAllRulesToTables(
-            ParserConfig cfg,
-            Func<Table> freshTableFactory,
-            Action<string> log,
-            ISet<string>? excludeRules = null)
+        // ------------------- Partitioning core -------------------
+
+        /// <summary>
+        /// Split one table rule into multiple sibling elements by key column.
+        /// </summary>
+        public static IEnumerable<XElement> BuildPartitionedTableElements(string ruleName, Table t, TablePartition partition)
         {
-            foreach (var rule in cfg.Rules)
+            if (partition == null)
             {
-                if (excludeRules != null && excludeRules.Contains(rule.Name))
+                yield return BuildTableElement(ruleName, t);
+                yield break;
+            }
+
+            if (!partition.Column.TryResolveIndex(t, out int keyCol))
+            {
+                // If can't resolve partition column, fall back to single element.
+                yield return BuildTableElement(ruleName, t);
+                yield break;
+            }
+
+            var comparer = partition.CaseInsensitive ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            var groups = new Dictionary<string, List<int>>(comparer);
+
+            for (int i = 0; i < t.Rows.Count; i++)
+            {
+                var cells = t.Rows[i];
+                string key = keyCol < cells.Length ? (cells[keyCol] ?? "") : "";
+
+                if (partition.TrimKey) key = key.Trim();
+
+                if (string.IsNullOrEmpty(key))
                 {
-                    log($"[skip] Rule '{rule.Name}' excluded.");
-                    continue;
+                    if (partition.DropEmptyKeyRows) continue;
+                    key = partition.EmptyKeyLabel ?? "";
                 }
 
-                var table = freshTableFactory();
-                log($"--- Running Rule: {rule.Name} ---");
-
-                int totalEnabled = rule.RuleSteps.Count(s => s.Enabled);
-                int step = 0;
-                foreach (var s in rule.RuleSteps)
+                if (!groups.TryGetValue(key, out var list))
                 {
-                    if (!s.Enabled) { log($"(skipped) {s.Describe()}"); continue; }
-                    step++;
-                    ParserRunner.ApplySingleStep(s, table, cfg.MissingPolicy, msg => log($"    {msg}"));
+                    list = new List<int>();
+                    groups[key] = list;
+                }
+                list.Add(i);
+            }
+
+            string elementName = XmlNameHelper.MakeElementName(ruleName);
+            string keyAttrName = XmlNameHelper.MakeAttributeName(
+                !string.IsNullOrWhiteSpace(partition.AttributeName)
+                    ? partition.AttributeName!
+                    : (keyCol >= 0 && keyCol < t.ColumnNames.Count ? t.ColumnNames[keyCol] : "Key"));
+
+            var attrNames = PrepareUniqueAttributeNames(t.ColumnNames);
+
+            foreach (var kv in groups) // stable-enough order by first appearance
+            {
+                var elem = new XElement(elementName);
+                elem.SetAttributeValue(keyAttrName, kv.Key);
+                elem.SetAttributeValue("rowCount", kv.Value.Count);
+
+                foreach (var rowIndex in kv.Value)
+                {
+                    var row = new XElement("Row");
+                    row.SetAttributeValue("i", rowIndex);
+                    if (rowIndex < t.RowPages.Count) row.SetAttributeValue("page", t.RowPages[rowIndex]);
+
+                    var cells = t.Rows[rowIndex];
+
+                    for (int c = 0; c < attrNames.Count; c++)
+                    {
+                        if (!partition.KeepKeyInRows && c == keyCol) continue;
+
+                        string an = attrNames[c];
+                        string val = c < cells.Length ? (cells[c] ?? "") : "";
+                        row.SetAttributeValue(an, val);
+                    }
+
+                    elem.Add(row);
                 }
 
-                yield return (rule, table);
+                yield return elem;
             }
         }
 
-        // ===== Build <HeaderInfo .../> from scalar rules =====
-        private static void AppendScalars(XElement headerInfo, IEnumerable<(RuleDefinition rule, Table table)> runs)
-        {
-            foreach (var (rule, table) in runs)
-            {
-                if (!table.IsScalar) continue;
+        // ------------------- Shared building blocks -------------------
 
-                var baseName = XmlNameHelper.MakeAttributeName(rule.Name);
-                var unique = UniqueAttributeName(headerInfo, baseName);
-                headerInfo.SetAttributeValue(unique, table.ScalarValue ?? "");
-            }
-        }
-
-        // ===== Build per-table-rule elements with <Row/> children =====
-        private static void AppendTables(XElement root, IEnumerable<(RuleDefinition rule, Table table)> runs)
-        {
-            foreach (var (rule, table) in runs)
-            {
-                if (table.IsScalar) continue;
-
-                var desired = XmlNameHelper.MakeElementName(rule.Name);
-                var uniqueLocal = UniqueChildElementLocalName(root, desired);
-
-                // Build and (if needed) rename to unique name
-                var elem = BuildTableElement(rule.Name, table);
-                if (!string.Equals(elem.Name.LocalName, uniqueLocal, StringComparison.Ordinal))
-                    elem.Name = uniqueLocal;
-
-                root.Add(elem);
-            }
-        }
-
-        // ===== Existing helpers kept from your earlier file =====
         public static XDocument TableToResultDocument(Table t, string elementName = "Current")
         {
-            var doc = new XDocument(new XDeclaration("1.0", "utf-8", "yes"));
-            var root = new XElement("Result",
-                new XAttribute("ranAt", DateTime.UtcNow.ToString("o")));
-            doc.Add(root);
-
+            var doc = NewResultDoc(out var root);
             var tableElem = BuildTableElement(elementName, t);
             root.Add(tableElem);
-
             return doc;
         }
 
@@ -285,29 +343,31 @@ namespace PdfTableMvp.Core
             return result;
         }
 
-        // ===== Local name uniqueness helpers =====
-        private static string UniqueAttributeName(XElement element, string baseName)
+        // ------------------- Internals -------------------
+
+        private static XDocument NewResultDoc(out XElement root)
         {
-            // Attributes are case-sensitive by XML rules; use exact local name matching here.
-            if (element.Attribute(baseName) == null) return baseName;
-            int k = 2;
-            while (element.Attribute(baseName + "_" + k) != null) k++;
-            return baseName + "_" + k;
+            var doc = new XDocument(new XDeclaration("1.0", "utf-8", "yes"));
+            root = new XElement("Result",
+                new XAttribute("ranAt", DateTime.UtcNow.ToString("o")));
+            doc.Add(root);
+            return doc;
         }
 
-        private static string UniqueChildElementLocalName(XElement parent, string desiredLocalName)
+        private static Table RunRuleToTable(ParserConfig cfg, RuleDefinition rule, Func<Table> freshTableFactory, Action<string> log)
         {
-            if (!parent.Elements().Any(e => e.Name.LocalName.Equals(desiredLocalName, StringComparison.Ordinal)))
-                return desiredLocalName;
+            var t = freshTableFactory();
+            int totalEnabled = rule.RuleSteps.Count(s => s.Enabled);
+            int step = 0;
 
-            int k = 2;
-            string candidate;
-            do
+            foreach (var s in rule.RuleSteps)
             {
-                candidate = desiredLocalName + "_" + k++;
-            } while (parent.Elements().Any(e => e.Name.LocalName.Equals(candidate, StringComparison.Ordinal)));
+                if (!s.Enabled) continue;
+                step++;
+                ParserRunner.ApplySingleStep(s, t, cfg.MissingPolicy, _ => { });
+            }
 
-            return candidate;
+            return t;
         }
     }
 }

@@ -7,6 +7,7 @@ using iText.Kernel.Pdf.Canvas.Parser.Listener;
 using PdfTableMvp.Core;
 using System.Text;
 using System.Text.Json; // for CloneSteps deep copy of StepBase list
+using System.Xml.Linq;  // <-- added so we can Save() XDocument
 using CoreTable = PdfTableMvp.Core.Table;
 
 namespace PdfTableMvp
@@ -457,14 +458,13 @@ Actions:
                             var outPath = (Console.ReadLine() ?? "").Trim();
                             if (string.IsNullOrWhiteSpace(outPath)) outPath = "result.xml";
 
-                            // Export to XML: single parser or (if router exists) parent+target combined XML
-                            XmlExporter.ExportParserOrRoutedToXml(
+                            // Correct: get the XDocument, then save it
+                            var xdoc = XmlExporter.ExportParserOrRoutedToXml(
                                 cfg,
                                 () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
-                                outPath,
-                                msg => Console.WriteLine(msg)
-                            );
+                                msg => Console.WriteLine(msg));
 
+                            xdoc.Save(outPath);
                             Console.WriteLine($"Saved: {Path.GetFullPath(outPath)}");
                             break;
                         }
@@ -497,6 +497,136 @@ Actions:
                             Console.WriteLine("Converted to scalar. In option 17 (run ALL rules), this Rule will appear in HeaderInfo.");
                             break;
                         }
+                    case "19":
+                        {
+                            int pos = AskInt($"Insert position (0..{table.ColumnCount}, {table.ColumnCount}=end): ", 0, table.ColumnCount);
+                            Console.Write("New column name (blank = auto): "); var name = Console.ReadLine() ?? "";
+                            var step = new InsertBlankColumnStep { InsertIndex = pos, ColumnName = name };
+                            ApplyStep(step, table); sessionSteps.Add(step);
+                            Console.WriteLine($"Inserted. Cols={table.ColumnCount}");
+                            break;
+                        }
+                    case "20":
+                        {
+                            var srcSel = AskColumnSelector(table);
+                            bool createNew = AskYesNo("Create NEW destination column? (y/n): ");
+                            int destIndex;
+                            string newName = "";
+                            if (createNew)
+                            {
+                                destIndex = AskInt($"Insert new dest at index (0..{table.ColumnCount}, {table.ColumnCount}=end): ", 0, table.ColumnCount);
+                                Console.Write("New column name (blank = auto): "); newName = Console.ReadLine() ?? "";
+                            }
+                            else
+                            {
+                                destIndex = AskInt($"Destination index (0..{Math.Max(0, table.ColumnCount - 1)}): ", 0, Math.Max(0, table.ColumnCount - 1));
+                            }
+
+                            bool append = false; bool overwrite = true; string sep = " ";
+                            if (!createNew)
+                            {
+                                append = AskYesNo("Append to destination? (y=append / n=overwrite): ");
+                                overwrite = !append;
+                                if (append)
+                                {
+                                    Console.Write("Append separator [space]: "); var ssep = Console.ReadLine() ?? "";
+                                    if (!string.IsNullOrEmpty(ssep)) sep = ssep;
+                                }
+                            }
+                            bool onlyNonEmpty = AskYesNo("Only copy when SOURCE is non-empty? (y/n): ");
+
+                            var step = new CopyColumnStep
+                            {
+                                Source = srcSel,
+                                CreateNewDestination = createNew,
+                                DestinationIndex = destIndex,
+                                NewColumnName = newName,
+                                Append = append,
+                                Overwrite = overwrite,
+                                Separator = sep,
+                                OnlyWhenSourceNonEmpty = onlyNonEmpty
+                            };
+                            ApplyStep(step, table); sessionSteps.Add(step);
+                            Console.WriteLine("Copied.");
+                            break;
+                        }
+                    case "21":
+                        {
+                            var colSel = AskColumnSelector(table);
+                            Console.Write("Group START regex: "); var start = Console.ReadLine() ?? "";
+                            Console.Write("Group END regex (blank = until next START/table end): "); var end = Console.ReadLine() ?? "";
+                            bool ci = AskYesNo("Case-insensitive? (y/n): ");
+                            bool perPage = AskYesNo("Reset grouping at page boundaries? (y/n): ");
+                            Console.WriteLine("Merge strategy: 1=Concat space, 2=Concat newline, 3=First non-empty, 4=Last non-empty");
+                            int strat = AskInt("Pick (1..4): ", 1, 4);
+                            var strategy = strat switch
+                            {
+                                1 => MergeJoinStrategy.ConcatSpace,
+                                2 => MergeJoinStrategy.ConcatNewline,
+                                3 => MergeJoinStrategy.FirstNonEmpty,
+                                4 => MergeJoinStrategy.LastNonEmpty,
+                                _ => MergeJoinStrategy.ConcatSpace
+                            };
+                            var step = new MergeRowsByGroupStep
+                            {
+                                Col = colSel,
+                                StartPattern = start,
+                                EndPattern = string.IsNullOrWhiteSpace(end) ? null : end,
+                                CaseInsensitive = ci,
+                                ResetPerPage = perPage,
+                                Strategy = strategy
+                            };
+                            ApplyStep(step, table); sessionSteps.Add(step);
+                            Console.WriteLine($"Merged. Rows={table.Rows.Count}");
+                            break;
+                        }
+                    case "22":
+                        {
+                            var colSel = AskColumnSelector(table);
+                            Console.Write("Regex pattern: "); var pat = Console.ReadLine() ?? "";
+                            bool ci = AskYesNo("Case-insensitive? (y/n): ");
+                            bool all = AskYesNo("Extract ALL matches? (y/n): ");
+                            Console.Write("Capture group (0=whole, default 1): ");
+                            var gi = Console.ReadLine();
+                            int groupIndex = 1;
+                            if (int.TryParse(gi, out var gtemp) && gtemp >= 0 && gtemp <= 99) groupIndex = gtemp;
+
+                            bool inPlace = AskYesNo("Write IN-PLACE? (y = in the same column / n = to new column[s]): ");
+
+                            bool expand = false; string joinSep = ", "; string newName = "";
+                            if (!inPlace)
+                            {
+                                if (all)
+                                {
+                                    expand = AskYesNo("Expand to MULTIPLE new columns (one per match)? (y/n): ");
+                                    if (!expand)
+                                    {
+                                        Console.Write("Join separator for all matches [, ]: ");
+                                        var js = Console.ReadLine();
+                                        if (!string.IsNullOrEmpty(js)) joinSep = js!;
+                                    }
+                                }
+                                Console.Write("New column base name (blank = auto): ");
+                                newName = Console.ReadLine() ?? "";
+                            }
+
+                            var step = new RegexExtractStep
+                            {
+                                Col = colSel,
+                                Pattern = pat,
+                                CaseInsensitive = ci,
+                                Group = groupIndex,
+                                AllMatches = all,
+                                InPlace = inPlace,
+                                ExpandToMultipleColumns = !inPlace && all && expand,
+                                JoinSeparator = joinSep,
+                                NewColumnName = newName
+                            };
+                            ApplyStep(step, table); sessionSteps.Add(step);
+                            Console.WriteLine("Regex extract done.");
+                            break;
+                        }
+
 
                     // ====== SESSION editing ======
                     case "23":

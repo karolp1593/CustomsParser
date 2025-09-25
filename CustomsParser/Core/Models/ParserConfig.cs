@@ -12,5 +12,10 @@
     {
         public string Name { get; set; } = "Rule";
         public List<StepBase> RuleSteps { get; set; } = new();
+        /// <summary>
+        /// OPTIONAL: If provided and the rule is a TABLE, split output into multiple elements by the key column.
+        /// Ignored for scalar rules.
+        /// </summary>
+        public TablePartition? Partition { get; set; }
     }
 }
