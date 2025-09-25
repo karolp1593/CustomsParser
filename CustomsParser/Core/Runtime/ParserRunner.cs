@@ -26,31 +26,20 @@ namespace PdfTableMvp.Core
         public static void ApplySingleStep(StepBase step, Table t, MissingColumnPolicy policy, Action<string> log)
             => step.Apply(t, policy, log);
 
-        // Base version (kept)
-        public static Dictionary<string, object> RunAllRulesToJsonValues(
-            ParserConfig cfg,
-            Func<Table> freshTableFactory,
-            Action<string> log)
-            => RunAllRulesToJsonValues(cfg, freshTableFactory, log, excludeRules: null);
-
-        // New overload with exclude list
+        // --------- Base: run ALL rules of a single parser -> values ---------
         public static Dictionary<string, object> RunAllRulesToJsonValues(
             ParserConfig cfg,
             Func<Table> freshTableFactory,
             Action<string> log,
-            IEnumerable<string>? excludeRules)
+            ISet<string>? excludeRules = null)
         {
             var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
-            var exclude = new HashSet<string>(
-                (excludeRules ?? Array.Empty<string>()),
-                StringComparer.OrdinalIgnoreCase);
-
             foreach (var rule in cfg.Rules)
             {
-                if (exclude.Contains(rule.Name))
+                if (excludeRules != null && excludeRules.Contains(rule.Name))
                 {
-                    log($"[skip] Rule '{rule.Name}' excluded by router.");
+                    log($"[skip] Rule '{rule.Name}' excluded.");
                     continue;
                 }
 
@@ -112,6 +101,7 @@ namespace PdfTableMvp.Core
             }
 
             var t = freshTableFactory();
+            int totalEnabled = tagRule.RuleSteps.Count(s => s.Enabled);
             int step = 0;
             foreach (var s in tagRule.RuleSteps)
             {
@@ -139,16 +129,14 @@ namespace PdfTableMvp.Core
             return false;
         }
 
-        // NEW: resolve a target parser, then RUN ALL RULES of that parser and return aggregated JSON
+        // Legacy: run ONLY one rule of the target (kept for option 14 backward-compat)
         public static bool TryRunWithRouting(
             ParserConfig parentParser,
             Func<Table> freshTableFactory,
-            Action<string> log,
-            out string? targetParserName,
-            out Dictionary<string, object>? aggregatedJson)
+            out Table? routedResult,
+            Action<string> log)
         {
-            targetParserName = null;
-            aggregatedJson = null;
+            routedResult = null;
 
             var router = ParserStore.LoadRouter(parentParser.Name);
             if (router.Routes.Count == 0 && string.IsNullOrWhiteSpace(router.DefaultTargetParser))
@@ -192,15 +180,91 @@ namespace PdfTableMvp.Core
             }
 
             var targetCfg = ParserStore.Load(targetParser!);
-            targetParserName = targetCfg.Name;
 
-            // Run ALL rules of the target parser, optionally excluding some
-            aggregatedJson = RunAllRulesToJsonValues(
-                targetCfg,
-                freshTableFactory: freshTableFactory,
-                log: m => log($"[routed] {m}"),
-                excludeRules: router.ExcludeRules
-            );
+            // Choose first rule as "preview" (keep existing UX of option 14)
+            string ruleName = targetCfg.Rules.FirstOrDefault()?.Name
+                              ?? throw new Exception($"Target parser '{targetCfg.Name}' has no rules.");
+
+            var t = freshTableFactory();
+            RunRule(targetCfg, ruleName, t, m => log($"[routed] {m}"));
+            routedResult = t;
+            return true;
+        }
+
+        // NEW: build a SINGLE JSON that contains Parent + Routed Sub-Parser results (for option 17)
+        public static bool TryBuildCombinedRouterExport(
+            ParserConfig parentParser,
+            Func<Table> freshTableFactory,
+            out Dictionary<string, object> export,
+            Action<string> log)
+        {
+            export = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+            var router = ParserStore.LoadRouter(parentParser.Name);
+            if (router.Routes.Count == 0 && string.IsNullOrWhiteSpace(router.DefaultTargetParser))
+            {
+                log($"Router: no routes configured for parser '{parentParser.Name}'.");
+                return false;
+            }
+
+            if (!TryEvaluateTag(parentParser, router.TagRuleName, freshTableFactory, log, out var tag))
+                return false;
+
+            // find match
+            RouteRule? winner = null;
+            foreach (var r in router.Routes)
+            {
+                bool match = r.Kind switch
+                {
+                    RouteMatchKind.Exact => string.Equals(
+                        tag,
+                        r.Pattern,
+                        r.CaseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.CurrentCulture),
+                    RouteMatchKind.Regex => Regex.IsMatch(
+                        tag ?? "",
+                        r.Pattern ?? "",
+                        r.CaseInsensitive ? RegexOptions.IgnoreCase : RegexOptions.None),
+                    _ => false
+                };
+                if (match) { winner = r; break; }
+            }
+
+            string? targetParserName = winner?.TargetParser ?? router.DefaultTargetParser;
+
+            if (winner != null)
+                log($"Router: matched {winner.Kind} '{winner.Pattern}' -> {targetParserName}");
+            else if (!string.IsNullOrWhiteSpace(targetParserName))
+                log($"Router: no rule matched; using DEFAULT -> {targetParserName}");
+            else
+            {
+                log("Router: no route matched and no default specified.");
+                return false;
+            }
+
+            var targetCfg = ParserStore.Load(targetParserName!);
+
+            // Optional exclusions (if you later add ExcludeRules to RouterConfig)
+            ISet<string>? exclude = null; // keep null unless you add property
+            // Example if you add: exclude = new HashSet<string>(router.ExcludeRules ?? new(), StringComparer.OrdinalIgnoreCase);
+
+            // Run ALL rules on PARENT (include Tag too)
+            var parentValues = RunAllRulesToJsonValues(parentParser, freshTableFactory, msg => log($"[parent] {msg}"));
+
+            // Run ALL rules on TARGET (optionally exclude some)
+            var targetValues = RunAllRulesToJsonValues(targetCfg, freshTableFactory, msg => log($"[target] {msg}"), exclude);
+
+            // Build nested export
+            export["_router"] = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["parentParser"] = parentParser.Name,
+                ["tagRule"] = router.TagRuleName,
+                ["tagValue"] = tag ?? string.Empty,
+                ["targetParser"] = targetCfg.Name
+            };
+
+            export[parentParser.Name] = parentValues;
+            export[targetCfg.Name] = targetValues;
+
             return true;
         }
 

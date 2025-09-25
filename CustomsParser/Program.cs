@@ -398,81 +398,39 @@ Actions:
 
                             var cfg = ParserStore.Load(names[pick]);
 
-                            // Transparent Multi-Parser: if router exists, auto-route and RUN ALL RULES of target parser
+                            // Transparent Multi-Parser: if router exists, auto-route and run
                             if (ParserStore.RouterExists(cfg.Name) &&
                                 ParserRunner.TryRunWithRouting(
                                     cfg,
                                     () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
-                                    msg => Console.WriteLine(msg),
-                                    out var targetParserName,
-                                    out var aggregated))
+                                    out var routed,
+                                    msg => Console.WriteLine(msg)))
                             {
-                                Console.WriteLine($"\n--- ROUTED to parser: {targetParserName} ---");
-                                Console.WriteLine("Summary of results per rule:");
-                                foreach (var kv in aggregated!)
-                                {
-                                    var kind = kv.Value is string ? "scalar" : "rows";
-                                    if (kv.Value is string s)
-                                        Console.WriteLine($" • {kv.Key}: SCALAR = \"{s}\"");
-                                    else if (kv.Value is System.Text.Json.Nodes.JsonArray)
-                                        Console.WriteLine($" • {kv.Key}: JSON array");
-                                    else if (kv.Value is IEnumerable<object> en)
-                                        Console.WriteLine($" • {kv.Key}: {en.Cast<object>().Count()} row(s)");
-                                    else
-                                        Console.WriteLine($" • {kv.Key}: {kv.Value?.GetType().Name ?? "null"}");
-                                }
-
-                                if (AskYesNo("Export aggregated JSON? (y/n): "))
-                                {
-                                    Console.Write("Output path [routed_output.json]: ");
-                                    var outPath = (Console.ReadLine() ?? "").Trim();
-                                    if (string.IsNullOrWhiteSpace(outPath)) outPath = "routed_output.json";
-                                    var json = System.Text.Json.JsonSerializer.Serialize(aggregated, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-                                    File.WriteAllText(outPath, json);
-                                    Console.WriteLine($"Saved: {Path.GetFullPath(outPath)}");
-                                }
-
-                                // Optional: preview a single rule from TARGET parser
-                                if (AskYesNo("Preview a specific rule from the target parser? (y/n): "))
-                                {
-                                    var targetCfg = ParserStore.Load(targetParserName!);
-                                    if (targetCfg.Rules.Count == 0) { Console.WriteLine("Target parser has no rules."); break; }
-                                    Console.WriteLine($"\n{targetCfg.Name} rules:");
-                                    for (int i = 0; i < targetCfg.Rules.Count; i++)
-                                        Console.WriteLine($"{i + 1}) {targetCfg.Rules[i].Name}");
-
-                                    int ri = AskInt($"Preview which rule (1..{targetCfg.Rules.Count}): ", 1, targetCfg.Rules.Count) - 1;
-
-                                    var fresh = CoreTable.FromSingleColumnLines(originalLines, originalRowPages);
-                                    ParserRunner.RunRule(targetCfg, targetCfg.Rules[ri].Name, fresh, msg => Console.WriteLine(msg));
-
-                                    Console.WriteLine("\n--- RULE PREVIEW ---");
-                                    PreviewTable(fresh, 50, showPages: true, showRowIndex: true);
-
-                                    // keep this preview as working table so user can continue
-                                    table = fresh;
-                                }
+                                table = routed!;
+                                Console.WriteLine("\n--- ROUTED RESULT PREVIEW ---");
+                                PreviewTable(table, 50, showPages: true, showRowIndex: true);
                                 break;
                             }
 
-                            // Fallback: manual single-rule run (same as before)
+                            // Fallback: manual single-rule run
                             if (cfg.Rules.Count == 0) { Console.WriteLine("This parser has no Rules."); break; }
 
                             Console.WriteLine($"\nParser '{cfg.Name}' rules:");
                             for (int i = 0; i < cfg.Rules.Count; i++)
                                 Console.WriteLine($"{i + 1}) {cfg.Rules[i].Name} ({cfg.Rules[i].RuleSteps.Count} step(s))");
 
-                            int ri2 = AskInt($"Run which Rule (1..{cfg.Rules.Count}): ", 1, cfg.Rules.Count) - 1;
+                            int ri = AskInt($"Run which Rule (1..{cfg.Rules.Count}): ", 1, cfg.Rules.Count) - 1;
 
-                            var fresh2 = CoreTable.FromSingleColumnLines(originalLines, originalRowPages);
-                            ParserRunner.RunRule(cfg, cfg.Rules[ri2].Name, fresh2, msg => Console.WriteLine(msg));
+                            var fresh = CoreTable.FromSingleColumnLines(originalLines, originalRowPages);
+                            ParserRunner.RunRule(cfg, cfg.Rules[ri].Name, fresh, msg => Console.WriteLine(msg));
 
                             Console.WriteLine("\n--- RESULT PREVIEW ---");
-                            PreviewTable(fresh2, 50, showPages: true, showRowIndex: true);
+                            PreviewTable(fresh, 50, showPages: true, showRowIndex: true);
 
-                            table = fresh2;
+                            table = fresh;
                             break;
                         }
+
 
                     case "15":
                         {
@@ -500,15 +458,32 @@ Actions:
                             var outPath = (Console.ReadLine() ?? "").Trim();
                             if (string.IsNullOrWhiteSpace(outPath)) outPath = "all_rules_output.json";
 
-                            ParserRunner.ExportAllRulesToOneJson(
-                                cfg,
-                                () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
-                                outPath,
-                                msg => Console.WriteLine(msg)
-                            );
-                            Console.WriteLine($"Saved: {Path.GetFullPath(outPath)}");
+                            // If router exists for this parser, export PARENT + ROUTED SUBPARSER together.
+                            if (ParserStore.RouterExists(cfg.Name) &&
+                                ParserRunner.TryBuildCombinedRouterExport(
+                                    cfg,
+                                    () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
+                                    out var combined,
+                                    msg => Console.WriteLine(msg)))
+                            {
+                                var json = System.Text.Json.JsonSerializer.Serialize(combined, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                                File.WriteAllText(outPath, json);
+                                Console.WriteLine($"Saved combined (parent + routed) export: {Path.GetFullPath(outPath)}");
+                            }
+                            else
+                            {
+                                // Fallback: single parser export (no router)
+                                ParserRunner.ExportAllRulesToOneJson(
+                                    cfg,
+                                    () => CoreTable.FromSingleColumnLines(originalLines, originalRowPages),
+                                    outPath,
+                                    msg => Console.WriteLine(msg)
+                                );
+                                Console.WriteLine($"Saved: {Path.GetFullPath(outPath)}");
+                            }
                             break;
                         }
+
 
                     case "18":
                         {
